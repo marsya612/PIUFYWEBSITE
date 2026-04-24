@@ -1,0 +1,468 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Piutang;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Storage; // ✅ tambahkan ini
+use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Auth;
+
+class PiutangController extends Controller
+{
+
+    public function index(Request $request)
+    {
+        $query = Piutang::where('user_id', Auth::id());
+
+        if ($request->search) {
+            $query->where(function ($q) use ($request) {
+                $q->where('nama_klien', 'like', '%' . $request->search . '%')
+                ->orWhere('nama_proyek', 'like', '%' . $request->search . '%')
+                ->orWhere('no_tagihan', 'like', '%' . $request->search . '%');
+            });
+        }
+
+        if ($request->klien) {
+            $query->where('nama_klien', $request->klien);
+        }
+
+        if ($request->status) {
+            if ($request->status == 'lunas') {
+                $query->where('status', 'lunas');
+            } else {
+                $query->where('status', '!=', 'lunas');
+
+                if ($request->status == 'tertunggak') {
+                    $query->whereDate('tanggal_jatuh_tempo', '<', now());
+                } elseif ($request->status == 'segera') {
+                    $query->whereBetween('tanggal_jatuh_tempo', [now(), now()->addDays(7)]);
+                } elseif ($request->status == 'belum') {
+                    $query->whereDate('tanggal_jatuh_tempo', '>', now()->addDays(7));
+                }
+            }
+        }
+
+        $piutangs = $query->latest()->get();
+
+        $klienList = Piutang::where('user_id', Auth::id())
+            ->select('nama_klien')
+            ->distinct()
+            ->pluck('nama_klien');
+
+        return view('piutang', compact('piutangs', 'klienList')); // ✅ BALIK KE PIUTANG
+    }
+
+    public function dashboard()
+    {
+        // 🔥 ambil data sesuai user login
+        $data = Piutang::where('user_id', Auth::id())->get();
+
+        $today = now()->startOfDay();
+
+        // 🔥 hitung status dinamis + sisa hari
+        $data = $data->map(function ($item) use ($today) {
+
+            $jatuhTempo = Carbon::parse($item->tanggal_jatuh_tempo)->startOfDay();
+            $sisaHari = (int) $today->diffInDays($jatuhTempo, false);
+
+            // STATUS DINAMIS
+            if ($item->status == 'lunas') {
+                $status_label = 'lunas';
+            } elseif ($sisaHari < 0) {
+                $status_label = 'tertunggak';
+            } elseif ($sisaHari <= 7) {
+                $status_label = 'segera';
+            } else {
+                $status_label = 'belum';
+            }
+
+            $item->status_label = $status_label;
+            $item->sisaHari = $sisaHari;
+
+            return $item;
+        });
+
+        // 🔥 TOTAL PIUTANG (belum lunas)
+        $totalPiutang = $data->where('status', '!=', 'lunas')->sum('nilai_tagihan');
+        $totalTagihanAktif = $data->where('status', '!=', 'lunas')->count();
+
+        // 🔥 TERTUNGGAK
+        $totalTertunggak = $data->where('status_label', 'tertunggak')->sum('nilai_tagihan');
+        $countTertunggak = $data->where('status_label', 'tertunggak')->count();
+
+        // 🔥 JATUH TEMPO (≤ 7 hari)
+        $totalJatuhTempo = $data->where('status_label', 'segera')->sum('nilai_tagihan');
+        $countJatuhTempo = $data->where('status_label', 'segera')->count();
+
+        // 🔥 LUNAS BULAN INI
+        $lunasBulanIni = $data->filter(function ($item) {
+            return $item->status == 'lunas' &&
+                Carbon::parse($item->updated_at)->isCurrentMonth();
+        });
+
+        $totalLunas = $lunasBulanIni->sum('nilai_tagihan');
+        $countLunas = $lunasBulanIni->count();
+
+        // 🔥 DATA TERBARU
+        $latest = $data->sortByDesc('tanggal_terbit')->take(5);
+
+        // 🔥 PERSENTASE
+        $totalAll = $data->count();
+
+        $persenLunas = $totalAll > 0
+            ? ($countLunas / $totalAll) * 100
+            : 0;
+
+        $persenTertunggak = $totalAll > 0
+            ? ($countTertunggak / $totalAll) * 100
+            : 0;
+
+        return view('home', compact(
+            'totalPiutang',
+            'totalTagihanAktif',
+            'totalTertunggak',
+            'countTertunggak',
+            'totalJatuhTempo',
+            'countJatuhTempo',
+            'totalLunas',
+            'countLunas',
+            'latest',
+            'persenLunas',
+            'persenTertunggak'
+        ));
+    }
+    public function create()
+    {
+        return view('tambahtagihan');
+    }
+
+    public function store(Request $request)
+    {
+        $validated = $request->validate([
+            'no_tagihan' => 'required|unique:piutangs,no_tagihan',
+            'nama_klien' => 'required',
+            'nama_proyek' => 'required',
+            'termin' => 'required',
+            'nilai_tagihan' => 'required|numeric',
+            'metode_pembayaran' => 'required',
+            'tanggal_terbit' => 'required|date',
+            'tanggal_jatuh_tempo' => 'required|date',
+            'catatan' => 'nullable',
+        ]);
+
+        // default status
+        $validated['status'] = 'belum';
+
+        // 🔥 WAJIB: simpan sesuai user login
+        $validated['user_id'] = Auth::id();
+
+        Piutang::create($validated);
+
+        return redirect()->route('piutang.index')
+            ->with('success', 'Tagihan berhasil ditambahkan');
+    }
+    public function edit($id)
+    {
+        $piutang = Piutang::findOrFail($id);
+        return view('edittagihan', compact('piutang'));
+    }
+    
+
+    public function update(Request $request, $id)
+    {
+        $request->validate([
+
+            'nama_klien' => 'required',
+            'nama_proyek' => 'required',
+            'termin' => 'required',
+            'nilai_tagihan' => 'required|numeric',
+            'metode_pembayaran' => 'required|in:Reguler,SKBDN',
+            'tanggal_terbit' => 'required|date',
+            'tanggal_jatuh_tempo' => 'required|date',
+            'catatan' => 'nullable',
+        ]);
+
+        $piutang = Piutang::findOrFail($id);
+        $piutang->update($request->all());
+        $request->validate([
+            'no_tagihan' => 'required|unique:piutangs,no_tagihan,' . $id,
+        ]);
+
+        return redirect()->route('piutang.index')
+            ->with('success', 'Data berhasil diupdate');
+    }
+
+    public function data(Request $request)
+    {
+        // 🔥 FILTER BERDASARKAN USER LOGIN
+        $query = Piutang::where('user_id', Auth::id());
+        
+
+        // FILTER TANGGAL
+        if ($request->from) {
+            $query->whereDate('tanggal_terbit', '>=', $request->from);
+        }
+
+        if ($request->to) {
+            $query->whereDate('tanggal_terbit', '<=', $request->to);
+        }
+
+        // FILTER KLIEN
+        if ($request->klien) {
+            $query->where('nama_klien', $request->klien);
+        }
+
+        $data = $query->get()->map(function ($item) {
+
+            $today = now()->startOfDay();
+            $jatuhTempo = \Carbon\Carbon::parse($item->tanggal_jatuh_tempo)->startOfDay();
+
+            $sisaHari = (int) $today->diffInDays($jatuhTempo, false);
+
+            // STATUS DINAMIS
+            if ($item->status == 'lunas') {
+                $status = 'lunas';
+
+            } elseif ($sisaHari < 0) {
+                $status = 'tertunggak';
+
+            } elseif ($sisaHari <= 3) {
+                $status = 'segera';
+
+            } else {
+                $status = 'belum tempo';
+            }
+
+            return [
+                'status' => $status,
+                'nama_klien' => $item->nama_klien ?? '-',
+                'nilai_piutang' => (float) ($item->nilai_tagihan ?? 0),
+            ];
+        });
+
+        // FILTER STATUS
+        if ($request->status) {
+            $data = $data->where('status', $request->status)->values();
+        }
+
+        return response()->json($data);
+    }
+
+    public function laporan(Request $request)
+    {
+        // 🔥 FILTER DATA BERDASARKAN USER
+        $query = Piutang::where('user_id', Auth::id());
+
+        // FILTER TANGGAL
+        if ($request->from && $request->to) {
+            $query->whereBetween('tanggal_terbit', [$request->from, $request->to]);
+        }
+
+        // FILTER STATUS
+        if ($request->status) {
+            $query->where('status', $request->status);
+        }
+
+        // FILTER KLIEN
+        if ($request->klien) {
+            $query->where('nama_klien', $request->klien);
+        }
+
+        $data = $query->get();
+
+        // 🔥 FILTER KLIEN JUGA BERDASARKAN USER
+        $klienList = Piutang::where('user_id', Auth::id())
+            ->select('nama_klien')
+            ->distinct()
+            ->orderBy('nama_klien')
+            ->pluck('nama_klien');
+
+        return view('laporan', compact('data', 'klienList'));
+    }
+
+    public function markLunas($id)
+    {
+        $piutang = Piutang::findOrFail($id);
+
+        $piutang->status = 'lunas';
+        $piutang->save();
+
+        return redirect()->route('piutang.index');
+    }
+
+    public function destroy($id)
+    {
+        $piutang = Piutang::findOrFail($id);
+        $piutang->delete();
+
+        return redirect()->route('piutang.index')
+            ->with('success', 'Data piutang berhasil dihapus');
+    }
+
+
+    // 🔹 HALAMAN PROFILE
+    public function profile()
+    {
+        $user = auth()->user();
+        return view('profile', compact('user'));
+    }
+
+    // 🔹 HALAMAN EDIT PROFILE
+    public function editProfile()
+    {
+        $user = auth()->user();
+        return view('edit_profile', compact('user'));
+    }
+
+    // 🔹 UPDATE PROFILE
+
+
+    // public function updateProfile(Request $request)
+    // {
+    //     $user = auth()->user();
+
+    //     $request->validate([
+    //         'name' => 'required',
+    //         'email' => 'required|email|unique:users,email,' . $user->id,
+    //         'photo' => 'nullable|image|mimes:jpg,jpeg,png|max:2048',
+    //     ]);
+
+    //     // HANDLE UPLOAD FOTO
+    //     if ($request->hasFile('photo')) {
+
+    //         // hapus foto lama (optional)
+    //         if ($user->photo) {
+    //             Storage::delete($user->photo);
+    //         }
+
+    //         $path = $request->file('photo')->store('profile', 'public');
+
+    //         $user->photo = $path;
+    //     }
+
+    //     // update data lain
+    //     $user->update([
+    //         'name' => $request->name,
+    //         'email' => $request->email,
+    //         'phone' => $request->phone,
+    //         'jabatan' => $request->jabatan,
+    //         // 'divisi' => $request->divisi,
+    //         'photo' => $user->photo,
+    //     ]);
+
+    //     return redirect()->route('profile')->with('success', 'Profile updated');
+    // }
+    public function updateProfile(Request $request)
+    {
+        $user = auth()->user();
+
+        $request->validate([
+            'name' => 'required',
+            'email' => 'required|email|unique:users,email,' . $user->id,
+            'photo' => 'nullable|image|mimes:jpg,jpeg,png|max:2048',
+        ]);
+
+        // FOTO BARU
+        if ($request->hasFile('photo')) {
+
+            // hapus foto lama
+            if ($user->photo) {
+                Storage::disk('public')->delete($user->photo);
+            }
+
+            // simpan foto baru
+            $path = $request->file('photo')->store('profile', 'public');
+
+            $user->photo = $path;
+        }
+
+        $user->update([
+            'name' => $request->name,
+            'email' => $request->email,
+            'phone' => $request->phone,
+            'jabatan' => $request->jabatan,
+            'divisi' => $request->divisi,
+            'photo' => $user->photo,
+        ]);
+
+        return redirect()->route('profile')->with('success', 'Profile updated');
+    }
+
+    public function exportPdf(Request $request)
+    {
+        // $query = Piutang::query();
+        $query = Piutang::where('user_id', Auth::id());
+
+        if ($request->from) {
+            $query->whereDate('tanggal_terbit', '>=', $request->from);
+        }
+
+        if ($request->to) {
+            $query->whereDate('tanggal_terbit', '<=', $request->to);
+        }
+
+        if ($request->status) {
+            $query->where('status', $request->status);
+        }
+
+        if ($request->klien) {
+            $query->where('nama_klien', $request->klien);
+        }
+
+        $data = $query->get();
+
+        // 🔥 ambil periode dari tanggal_terbit
+        $minDate = $data->min('tanggal_terbit');
+        $maxDate = $data->max('tanggal_terbit');
+
+        // 🔥 load sekali aja
+        $pdf = Pdf::loadView('laporan_pdf', [
+            'data' => $data,
+            'minDate' => $minDate,
+            'maxDate' => $maxDate,
+        ]);
+
+        return $pdf->download('laporan-piutang.pdf');
+    }
+
+    public function kirimReminder()
+    {
+        $data = Piutang::where('status', '!=', 'lunas')->get();
+
+        foreach ($data as $item) {
+
+            $sisaHari = \Carbon\Carbon::now()
+                ->diffInDays($item->tanggal_jatuh_tempo, false);
+
+            if (in_array($sisaHari, [7,5,3])) {
+
+                Mail::to('email@klien.com') // 🔥 ganti dengan email klien
+                    ->send(new ReminderPiutangMail($item, $sisaHari));
+            }
+        }
+
+        return "Reminder terkirim";
+    }
+
+    public function notifikasi()
+    {
+        $today = now();
+
+        $notifikasi = Piutang::where('status', '!=', 'lunas')
+            ->get()
+            ->filter(function ($item) use ($today) {
+                $sisaHari = $today->diffInDays($item->tanggal_jatuh_tempo, false);
+                return in_array($sisaHari, [7,5,3]);
+            })
+            ->map(function ($item) use ($today) {
+                $item->sisaHari = $today->diffInDays($item->tanggal_jatuh_tempo, false);
+                return $item;
+            });
+
+        return view('notifikasi', compact('notifikasi'));
+    }
+
+}
